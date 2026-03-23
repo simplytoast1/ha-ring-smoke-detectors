@@ -1,0 +1,9 @@
+{
+  "domain": "ring_smoke_detectors",
+  "name": "Ring Smoke Detectors",
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "cloud_push",
+  "requirements": ["aiohttp>=3.9.0"],
+  "version": "1.0.0"
+}

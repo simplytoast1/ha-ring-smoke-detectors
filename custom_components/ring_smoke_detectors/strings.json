@@ -1,0 +1,29 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ring Account Login",
+        "description": "Enter your Ring account credentials. These are sent directly to Ring's servers and are not stored.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "2fa": {
+        "title": "Two-Factor Authentication",
+        "description": "{2fa_prompt}",
+        "data": {
+          "code": "Verification Code"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password. Please try again.",
+      "invalid_2fa_code": "Invalid verification code. Please try again.",
+      "unknown": "An unexpected error occurred. Check the logs for details."
+    },
+    "abort": {
+      "already_configured": "This Ring account is already configured."
+    }
+  }
+}
