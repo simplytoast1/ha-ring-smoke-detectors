@@ -1,4 +1,4 @@
-# Ring Smoke Detectors for Home Assistant
+# Kidde/Ring Smoke Detectors for Home Assistant
 
 A [HACS](https://hacs.xyz) custom integration for **Kidde/Ring smart smoke and CO detectors** — the WiFi-only, hubless models that are not supported by the standard [Ring integration](https://www.home-assistant.io/integrations/ring/).
 
