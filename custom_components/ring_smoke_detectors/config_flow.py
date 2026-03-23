@@ -128,7 +128,7 @@ class RingSmokeDetectorsConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required("code"): str,
                 }
             ),
-            description_placeholders={"2fa_prompt": self._2fa_prompt},
+            description_placeholders={"tfa_prompt": self._2fa_prompt},
             errors=errors,
         )
 

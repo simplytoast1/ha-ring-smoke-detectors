@@ -11,7 +11,7 @@
       },
       "2fa": {
         "title": "Two-Factor Authentication",
-        "description": "{2fa_prompt}",
+        "description": "{tfa_prompt}",
         "data": {
           "code": "Verification Code"
         }

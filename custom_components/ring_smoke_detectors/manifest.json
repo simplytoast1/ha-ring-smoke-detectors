@@ -4,8 +4,8 @@
   "codeowners": ["@simplytoast1"],
   "config_flow": true,
   "documentation": "https://github.com/simplytoast1/ha-ring-smoke-detectors",
-  "issue_tracker": "https://github.com/simplytoast1/ha-ring-smoke-detectors/issues",
   "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/simplytoast1/ha-ring-smoke-detectors/issues",
   "requirements": ["aiohttp>=3.9.0"],
   "version": "1.0.0"
 }
