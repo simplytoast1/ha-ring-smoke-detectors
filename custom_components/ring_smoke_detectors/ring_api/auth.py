@@ -15,6 +15,13 @@ The auth protocol:
 4. When the token expires (~1hr), refresh automatically
 
 The refresh token is base64-encoded JSON: { rt: "actual_token", hid: "hardware_id" }
+
+Error model:
+- RingApiError: transient or generic API failure (network, 5xx). Safe to retry.
+- RingAuthError: Ring definitively rejected the credentials or token.
+  Callers should treat this as "reauthentication required".
+- Ring2FARequired: a subclass of RingAuthError raised during interactive
+  login when Ring wants a verification code.
 """
 
 import asyncio
@@ -22,7 +29,8 @@ import base64
 import json
 import logging
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import aiohttp
 
@@ -30,12 +38,24 @@ from ..const import CLIENT_API_BASE, API_VERSION
 
 _LOGGER = logging.getLogger(__name__)
 
+OAUTH_URL = "https://oauth.ring.com/oauth/token"
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
-class RingAuthError(Exception):
-    """Ring authentication error."""
+# Ring can send very large retry-after values when it rate-limits an
+# account. Sleeping that long inside a coordinator refresh or config
+# entry setup would hang Home Assistant, so cap what we honor.
+MAX_RATE_LIMIT_WAIT = 60
 
 
-class Ring2FARequired(Exception):
+class RingApiError(Exception):
+    """Generic Ring API failure (network trouble, server errors)."""
+
+
+class RingAuthError(RingApiError):
+    """Ring definitively rejected the credentials or refresh token."""
+
+
+class Ring2FARequired(RingAuthError):
     """2FA verification code required."""
 
     def __init__(self, prompt: str) -> None:
@@ -69,15 +89,21 @@ def _parse_auth_config(raw_token: str | None) -> dict | None:
 
 
 class RingRestClient:
-    """Lean Ring REST client for OAuth and authenticated requests."""
+    """Lean Ring REST client for OAuth and authenticated requests.
+
+    The aiohttp session is owned by the caller (Home Assistant's shared
+    session); this class never creates or closes sessions.
+    """
 
     def __init__(
         self,
+        session: aiohttp.ClientSession,
         refresh_token: str | None = None,
         email: str | None = None,
         password: str | None = None,
         on_token_update: Callable[[str], None] | None = None,
     ) -> None:
+        self._session = session
         self.refresh_token = refresh_token
         self._email = email
         self._password = password
@@ -89,29 +115,17 @@ class RingRestClient:
             else str(uuid.uuid4())
         )
         self._access_token: str | None = None
-        self._session: aiohttp.ClientSession | None = None
         self._session_created = False
         self.prompt_for_2fa: str | None = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    async def close(self) -> None:
-        """Close the HTTP session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
 
     async def authenticate(self, two_factor_code: str | None = None) -> str:
         """Authenticate with Ring and return the refresh token.
 
         Handles 2FA challenges (raises Ring2FARequired with prompt),
-        token rotation, and credential fallback.
+        token rotation, and credential fallback. A definitive rejection
+        raises RingAuthError; transient failures raise RingApiError and
+        leave the stored refresh token intact so a later retry can work.
         """
-        session = await self._get_session()
-
         grant_data: dict[str, str]
         if self._auth_config and self._auth_config.get("rt") and not two_factor_code:
             grant_data = {
@@ -143,14 +157,14 @@ class RingRestClient:
         }
 
         try:
-            async with session.post(
-                "https://oauth.ring.com/oauth/token",
+            async with self._session.post(
+                OAUTH_URL,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=REQUEST_TIMEOUT,
             ) as resp:
                 if resp.status == 412:
-                    body = await resp.json()
+                    body = await self._safe_json(resp)
                     if "tsv_state" in body:
                         tsv_state = body["tsv_state"]
                         phone = body.get("phone", "")
@@ -166,31 +180,50 @@ class RingRestClient:
                     raise Ring2FARequired(self.prompt_for_2fa)
 
                 if resp.status == 400:
-                    body = await resp.json()
+                    body = await self._safe_json(resp)
                     error = body.get("error", "")
                     if str(error).startswith("Verification Code"):
                         self.prompt_for_2fa = (
                             "Invalid code entered. Please try again."
                         )
                         raise Ring2FARequired(self.prompt_for_2fa)
-                    raise RingAuthError(f"Authentication failed: {error}")
 
-                if resp.status != 200:
-                    text = await resp.text()
-                    if grant_data.get("grant_type") == "refresh_token":
+                if resp.status in (400, 401, 403):
+                    # Definitive rejection. If we were using a stored
+                    # refresh token and also have credentials (config
+                    # flow), fall back to a password login.
+                    if (
+                        grant_data["grant_type"] == "refresh_token"
+                        and self._email
+                        and self._password
+                    ):
                         self._auth_config = None
                         self.refresh_token = None
                         return await self.authenticate(two_factor_code)
+                    text = await resp.text()
                     raise RingAuthError(
-                        f"Authentication failed ({resp.status}): {text}"
+                        f"Ring rejected the credentials ({resp.status}): "
+                        f"{text[:200]}"
+                    )
+
+                if resp.status != 200:
+                    # Transient server trouble (5xx, unexpected status).
+                    # Keep the stored refresh token so retries can succeed
+                    # once Ring recovers.
+                    text = await resp.text()
+                    raise RingApiError(
+                        f"Ring OAuth endpoint returned {resp.status}: "
+                        f"{text[:200]}"
                     )
 
                 data = await resp.json()
 
-        except (Ring2FARequired, RingAuthError):
+        except RingApiError:
             raise
-        except aiohttp.ClientError as err:
-            raise RingAuthError(f"Network error during authentication: {err}") from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise RingApiError(
+                f"Network error during authentication: {err}"
+            ) from err
 
         self._access_token = data["access_token"]
 
@@ -206,52 +239,76 @@ class RingRestClient:
 
         return self.refresh_token
 
+    @staticmethod
+    async def _safe_json(resp: aiohttp.ClientResponse) -> dict:
+        """Parse a response body as JSON, returning {} on any mismatch."""
+        try:
+            body = await resp.json(content_type=None)
+        except (aiohttp.ClientError, json.JSONDecodeError, ValueError):
+            return {}
+        return body if isinstance(body, dict) else {}
+
     async def _ensure_access_token(self) -> None:
         if not self._access_token:
             await self.authenticate()
 
     async def _ensure_session(self) -> None:
-        """Create a Ring session (registers this device with Ring servers)."""
+        """Create a Ring session (registers this device with Ring servers).
+
+        Session creation is best-effort: network failures are logged and
+        skipped. A 401 triggers exactly one re-authentication attempt;
+        a second 401 is surfaced as an auth failure rather than recursing.
+        """
         if self._session_created:
             return
-        await self._ensure_access_token()
-        session = await self._get_session()
-        try:
-            async with session.post(
-                f"{CLIENT_API_BASE}session",
-                json={
-                    "device": {
-                        "hardware_id": self._hardware_id,
-                        "metadata": {
-                            "api_version": API_VERSION,
-                            "device_model": "ring-client-api",
-                        },
-                        "os": "android",
-                    }
-                },
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status == 401:
-                    self._access_token = None
-                    await self._ensure_access_token()
-                    return await self._ensure_session()
+
+        for attempt in range(2):
+            await self._ensure_access_token()
+            try:
+                async with self._session.post(
+                    f"{CLIENT_API_BASE}session",
+                    json={
+                        "device": {
+                            "hardware_id": self._hardware_id,
+                            "metadata": {
+                                "api_version": API_VERSION,
+                                "device_model": "ring-client-api",
+                            },
+                            "os": "android",
+                        }
+                    },
+                    headers={
+                        "Authorization": f"Bearer {self._access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                ) as resp:
+                    if resp.status == 401:
+                        self._access_token = None
+                        if attempt == 0:
+                            continue
+                        raise RingAuthError(
+                            "Ring session rejected the access token even "
+                            "after re-authentication"
+                        )
+                    self._session_created = True
+                    return
+            except (aiohttp.ClientError, TimeoutError) as err:
+                _LOGGER.warning(
+                    "Ring session creation failed (%s), continuing without it",
+                    err,
+                )
                 self._session_created = True
-        except aiohttp.ClientError as err:
-            _LOGGER.warning("Session creation failed: %s", err)
-            self._session_created = True
+                return
 
     async def request(self, url: str) -> Any:
         """Make an authenticated GET request to a Ring API endpoint."""
         await self._ensure_session()
-        session = await self._get_session()
 
-        for _attempt in range(3):
+        last_err: Exception | None = None
+        for attempt in range(3):
             try:
-                async with session.get(
+                async with self._session.get(
                     url,
                     headers={
                         "Authorization": f"Bearer {self._access_token}",
@@ -259,7 +316,7 @@ class RingRestClient:
                         "User-Agent": "android:com.ringapp",
                         "Accept": "application/json",
                     },
-                    timeout=aiohttp.ClientTimeout(total=20),
+                    timeout=REQUEST_TIMEOUT,
                 ) as resp:
                     if resp.status == 401:
                         self._access_token = None
@@ -267,11 +324,16 @@ class RingRestClient:
                         await self._ensure_session()
                         continue
                     if resp.status == 429:
-                        retry_after = resp.headers.get("retry-after", "60")
-                        wait = (
-                            int(retry_after) if retry_after.isdigit() else 60
+                        retry_after = resp.headers.get("retry-after", "")
+                        wait = min(
+                            int(retry_after)
+                            if retry_after.isdigit()
+                            else MAX_RATE_LIMIT_WAIT,
+                            MAX_RATE_LIMIT_WAIT,
                         )
-                        _LOGGER.warning("Rate limited, waiting %s seconds", wait)
+                        _LOGGER.warning(
+                            "Rate limited by Ring, waiting %s seconds", wait
+                        )
                         await asyncio.sleep(wait + 1)
                         continue
                     if resp.status == 504:
@@ -279,9 +341,15 @@ class RingRestClient:
                         continue
                     resp.raise_for_status()
                     return await resp.json()
-            except aiohttp.ClientError:
-                if _attempt == 2:
-                    raise
+            except (aiohttp.ClientError, TimeoutError) as err:
+                last_err = err
+                if attempt == 2:
+                    raise RingApiError(
+                        f"Request to {url} failed: {err}"
+                    ) from err
                 await asyncio.sleep(5)
 
-        raise RingAuthError(f"Request to {url} failed after retries")
+        raise RingApiError(
+            f"Request to {url} failed after retries"
+            + (f" (last error: {last_err})" if last_err else "")
+        )

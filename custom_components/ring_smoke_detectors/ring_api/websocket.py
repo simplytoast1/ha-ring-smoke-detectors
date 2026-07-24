@@ -16,40 +16,76 @@ Protocol (same as ring-client-api):
 3. Connect to wss://{host}/ws?authcode={ticket}&ack=false
 4. Send DeviceInfoDocGetList for each asset UUID
 5. Listen for responses and DataUpdate channel messages
+
+Reliability model:
+- The websocket is opened with a heartbeat so half-open TCP connections
+  are detected and closed by aiohttp, which ends the message loop.
+- When the message loop ends (or Ring asks us to reconnect), a single
+  reconnect task retries with capped exponential backoff until the
+  connection is back or disconnect() is called. The task reference is
+  held so it cannot be garbage collected and can be cancelled cleanly.
+- Connection state changes are reported through on_connection_change so
+  the coordinator can reflect availability on entities.
 """
 
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import aiohttp
 
-from ..const import APP_API_BASE
+from ..const import (
+    APP_API_BASE,
+    KIDDE_DEVICE_TYPE_SMOKE_ONLY,
+    KIDDE_KIND_PREFIX,
+    KIDDE_KIND_SMOKE_ONLY,
+)
 from .auth import RingRestClient
 
 _LOGGER = logging.getLogger(__name__)
 
 MAX_RECONNECT_DELAY = 60
 INITIAL_RECONNECT_DELAY = 5
+WS_HEARTBEAT = 30
+DISCOVERY_TIMEOUT = 15
 
 
 def is_kidde_asset(asset: dict) -> bool:
     """Check if a WebSocket ticket asset is a Kidde smoke detector."""
-    return asset.get("kind", "").startswith("sensor_bluejay")
+    return asset.get("kind", "").startswith(KIDDE_KIND_PREFIX)
 
 
 def is_kidde_device_type(device_type: str) -> bool:
     """Check if a WebSocket deviceType is a Kidde smoke detector."""
-    return "sensor_bluejay" in device_type
+    return KIDDE_KIND_PREFIX in device_type
 
 
 def is_smoke_only(device_type: str) -> bool:
     """Check if a device is smoke-only (no CO sensor)."""
-    return device_type in (
-        "sensor_bluejay_ws",
-        "comp.bluejay.sensor_bluejay_ws",
-    )
+    return device_type in (KIDDE_KIND_SMOKE_ONLY, KIDDE_DEVICE_TYPE_SMOKE_ONLY)
+
+
+def extract_impulses(data: dict) -> list[str]:
+    """Extract impulse event types from a raw DataUpdate body entry.
+
+    Impulses (one-shot events like the test button) arrive as
+    { impulse: { v1: [ { impulseType: "alarm.testing" }, ... ] } }
+    alongside the general/device sections. flatten_device_data drops
+    this section, so it must be read from the raw body.
+    """
+    impulse = data.get("impulse")
+    if not isinstance(impulse, dict):
+        return []
+    v1 = impulse.get("v1")
+    if not isinstance(v1, list):
+        return []
+    return [
+        i["impulseType"]
+        for i in v1
+        if isinstance(i, dict) and isinstance(i.get("impulseType"), str)
+    ]
 
 
 def flatten_device_data(data: dict) -> dict:
@@ -62,10 +98,12 @@ def flatten_device_data(data: dict) -> dict:
     We merge them via dict update -- same approach as ring-client-api.
     """
     result: dict[str, Any] = {}
-    if "general" in data and "v2" in data["general"]:
-        result.update(data["general"]["v2"])
-    if "device" in data and "v1" in data["device"]:
-        result.update(data["device"]["v1"])
+    general = data.get("general")
+    if isinstance(general, dict) and isinstance(general.get("v2"), dict):
+        result.update(general["v2"])
+    device = data.get("device")
+    if isinstance(device, dict) and isinstance(device.get("v1"), dict):
+        result.update(device["v1"])
     return result
 
 
@@ -75,6 +113,9 @@ class SmokeDetectorWebSocket:
     Manages the lifecycle of a WebSocket connection to Ring's servers
     for discovering and monitoring Kidde smoke detectors at a specific
     location. Handles auto-reconnect with exponential backoff.
+
+    The aiohttp session is owned by the caller (Home Assistant's shared
+    session) and is never closed here.
     """
 
     def __init__(
@@ -82,32 +123,60 @@ class SmokeDetectorWebSocket:
         location_id: str,
         location_name: str,
         rest_client: RingRestClient,
+        session: aiohttp.ClientSession,
         on_device_update: Callable[[dict], None] | None = None,
         on_devices_discovered: Callable[[list[dict]], None] | None = None,
+        on_connection_change: Callable[[bool], None] | None = None,
+        on_impulse: Callable[[str, list[str]], None] | None = None,
     ) -> None:
         self.location_id = location_id
         self.location_name = location_name
         self._rest_client = rest_client
+        self._session = session
         self._on_device_update = on_device_update
         self._on_devices_discovered = on_devices_discovered
+        self._on_connection_change = on_connection_change
+        self._on_impulse = on_impulse
         self._assets: list[dict] = []
         self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._ws_session: aiohttp.ClientSession | None = None
         self._disconnected = False
+        self._connected = False
         self._consecutive_failures = 0
         self._seq = 1
         self._devices: list[dict] = []
         self._received_asset_lists: set[str] = set()
         self._device_future: asyncio.Future[list[dict]] | None = None
         self._message_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
 
     @property
     def has_assets(self) -> bool:
         """Whether this location has any Kidde smoke detector assets."""
         return len(self._assets) > 0
 
+    @property
+    def connected(self) -> bool:
+        """Whether the websocket is currently established."""
+        return self._connected
+
     async def connect(self) -> list[dict]:
         """Establish the WebSocket connection and return discovered devices.
+
+        Raises on failure so the caller can decide how to handle it.
+        Once connected, reconnects are handled internally.
+        """
+        if self._disconnected:
+            return []
+        try:
+            return await self._establish()
+        except BaseException:
+            # Clean up a partially established connection so no message
+            # task or open socket outlives a failed connect.
+            await self._close_ws()
+            raise
+
+    async def _establish(self) -> list[dict]:
+        """Fetch a ticket, open the websocket, and run device discovery.
 
         1. Request ticket from clap/tickets endpoint
         2. Filter for sensor_bluejay_* assets (key difference from ring-client-api)
@@ -115,88 +184,84 @@ class SmokeDetectorWebSocket:
         4. Send DeviceInfoDocGetList for each asset
         5. Wait for all assets to respond with device data
         """
-        if self._disconnected:
+        ticket_url = (
+            f"{APP_API_BASE}clap/tickets"
+            f"?locationID={self.location_id}"
+            f"&enableExtendedEmergencyCellUsage=true"
+            f"&requestedTransport=ws"
+        )
+        ticket_response = await self._rest_client.request(ticket_url)
+        assets = ticket_response.get("assets", [])
+
+        supported_assets = [a for a in assets if is_kidde_asset(a)]
+        self._assets = supported_assets
+        self._received_asset_lists = set()
+        self._devices = []
+
+        if not supported_assets:
+            _LOGGER.debug(
+                'Location "%s": no Kidde assets found',
+                self.location_name,
+            )
             return []
+
+        _LOGGER.debug(
+            'Location "%s": %d websocket asset(s) -- %s',
+            self.location_name,
+            len(supported_assets),
+            ", ".join(
+                f"{a['uuid']} ({a['kind']}, {a.get('status', 'unknown')})"
+                for a in supported_assets
+            ),
+        )
+
+        ticket = ticket_response["ticket"]
+        host = ticket_response["host"]
+        ws_url = f"wss://{host}/ws?authcode={ticket}&ack=false"
+        ws = await self._session.ws_connect(ws_url, heartbeat=WS_HEARTBEAT)
+
+        if self._disconnected:
+            # disconnect() ran while the handshake was in flight
+            await ws.close()
+            return []
+
+        self._ws = ws
+        self._consecutive_failures = 0
+        self._connected = True
+        _LOGGER.info(
+            'WebSocket connected for location "%s"',
+            self.location_name,
+        )
+        if self._on_connection_change:
+            self._on_connection_change(True)
+
+        loop = asyncio.get_running_loop()
+        self._device_future = loop.create_future()
+        self._message_task = asyncio.create_task(self._message_loop())
+
+        for asset in supported_assets:
+            await self._send_message(
+                {"msg": "DeviceInfoDocGetList", "dst": asset["uuid"]}
+            )
 
         try:
-            ticket_url = (
-                f"{APP_API_BASE}clap/tickets"
-                f"?locationID={self.location_id}"
-                f"&enableExtendedEmergencyCellUsage=true"
-                f"&requestedTransport=ws"
+            devices = await asyncio.wait_for(
+                self._device_future, timeout=DISCOVERY_TIMEOUT
             )
-            ticket_response = await self._rest_client.request(ticket_url)
-            assets = ticket_response.get("assets", [])
-            ticket = ticket_response["ticket"]
-            host = ticket_response["host"]
-
-            supported_assets = [a for a in assets if is_kidde_asset(a)]
-            self._assets = supported_assets
-            self._received_asset_lists = set()
-            self._devices = []
-
-            if not supported_assets:
-                _LOGGER.debug(
-                    'Location "%s": no Kidde assets found',
-                    self.location_name,
-                )
-                return []
-
-            _LOGGER.debug(
-                'Location "%s": %d websocket asset(s) -- %s',
-                self.location_name,
-                len(supported_assets),
-                ", ".join(
-                    f"{a['uuid']} ({a['kind']}, {a.get('status', 'unknown')})"
-                    for a in supported_assets
-                ),
-            )
-
-            ws_url = f"wss://{host}/ws?authcode={ticket}&ack=false"
-            self._ws_session = aiohttp.ClientSession()
-            self._ws = await self._ws_session.ws_connect(ws_url)
-
-            self._consecutive_failures = 0
-            _LOGGER.info(
-                'WebSocket connected for location "%s"',
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                'Timed out waiting for device list from "%s"',
                 self.location_name,
             )
+            devices = list(self._devices)
 
-            for asset in supported_assets:
-                await self._send_message(
-                    {"msg": "DeviceInfoDocGetList", "dst": asset["uuid"]}
-                )
+        _LOGGER.info(
+            'Location "%s": discovered %d device(s)',
+            self.location_name,
+            len(devices),
+        )
 
-            loop = asyncio.get_running_loop()
-            self._device_future = loop.create_future()
-
-            self._message_task = asyncio.create_task(self._message_loop())
-
-            try:
-                devices = await asyncio.wait_for(self._device_future, timeout=15)
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    'Timed out waiting for device list from "%s"',
-                    self.location_name,
-                )
-                devices = list(self._devices)
-
-            _LOGGER.info(
-                'Location "%s": discovered %d device(s)',
-                self.location_name,
-                len(devices),
-            )
-
-            return devices
-
-        except Exception as err:
-            _LOGGER.error(
-                'WebSocket connect failed for "%s": %s',
-                self.location_name,
-                err,
-            )
-            self._consecutive_failures += 1
-            return []
+        return devices
 
     async def _message_loop(self) -> None:
         """Process incoming WebSocket messages."""
@@ -222,8 +287,7 @@ class SmokeDetectorWebSocket:
         except Exception as err:
             _LOGGER.debug("WebSocket message loop error: %s", err)
 
-        if not self._disconnected:
-            asyncio.create_task(self._reconnect())
+        self._schedule_reconnect()
 
     async def _handle_message(self, raw_data: str) -> None:
         """Parse and route a single WebSocket message."""
@@ -233,10 +297,13 @@ class SmokeDetectorWebSocket:
             _LOGGER.debug("Failed to parse WebSocket message")
             return
 
+        if not isinstance(parsed, dict):
+            return
+
         message = parsed.get("msg")
         channel = parsed.get("channel")
 
-        if not message:
+        if not isinstance(message, dict):
             return
 
         datatype = message.get("datatype")
@@ -247,17 +314,21 @@ class SmokeDetectorWebSocket:
                 'Hub disconnection for "%s", reconnecting...',
                 self.location_name,
             )
-            asyncio.create_task(self._reconnect())
+            self._schedule_reconnect()
             return
 
         msg_type = message.get("msg")
         body = message.get("body", [])
         src = message.get("src", "")
+        if not isinstance(body, list):
+            return
 
         # Initial device list response from DeviceInfoDocGetList
         if msg_type == "DeviceInfoDocGetList" and body:
             self._received_asset_lists.add(src)
             for data in body:
+                if not isinstance(data, dict):
+                    continue
                 flat = flatten_device_data(data)
                 existing = next(
                     (d for d in self._devices if d.get("zid") == flat.get("zid")),
@@ -282,36 +353,85 @@ class SmokeDetectorWebSocket:
             and body
         ):
             for data in body:
+                if not isinstance(data, dict):
+                    continue
                 flat = flatten_device_data(data)
                 if self._on_device_update:
                     self._on_device_update(flat)
+                impulses = extract_impulses(data)
+                if impulses:
+                    # Nobody has publicly captured a real test press yet,
+                    # so keep the raw payload available for diagnosis.
+                    _LOGGER.debug(
+                        "Impulse(s) %s for device %s, raw body: %s",
+                        impulses,
+                        flat.get("zid"),
+                        data,
+                    )
+                    zid = flat.get("zid")
+                    if zid and self._on_impulse:
+                        self._on_impulse(zid, impulses)
 
-    async def _reconnect(self) -> None:
-        """Reconnect with exponential backoff (5s -> 60s cap)."""
+    def _schedule_reconnect(self) -> None:
+        """Start the reconnect loop unless one is already running."""
         if self._disconnected:
             return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
-        await self._close_ws()
+    async def _reconnect_loop(self) -> None:
+        """Reconnect with exponential backoff (5s -> 60s cap).
 
-        self._consecutive_failures += 1
-        delay = min(
-            INITIAL_RECONNECT_DELAY * (2 ** (self._consecutive_failures - 1)),
-            MAX_RECONNECT_DELAY,
-        )
+        Keeps retrying until the connection is re-established or
+        disconnect() is called; a single failed attempt must never
+        end monitoring for the location.
+        """
+        while not self._disconnected:
+            await self._close_ws()
 
-        _LOGGER.info(
-            'Reconnecting for "%s" in %ds (attempt %d)',
-            self.location_name,
-            delay,
-            self._consecutive_failures,
-        )
+            self._consecutive_failures += 1
+            delay = min(
+                INITIAL_RECONNECT_DELAY * (2 ** (self._consecutive_failures - 1)),
+                MAX_RECONNECT_DELAY,
+            )
 
-        await asyncio.sleep(delay)
+            _LOGGER.info(
+                'Reconnecting for "%s" in %ds (attempt %d)',
+                self.location_name,
+                delay,
+                self._consecutive_failures,
+            )
 
-        if not self._disconnected:
-            devices = await self.connect()
+            await asyncio.sleep(delay)
+
+            if self._disconnected:
+                return
+
+            try:
+                devices = await self._establish()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.warning(
+                    'Reconnect attempt for "%s" failed: %s',
+                    self.location_name,
+                    err,
+                )
+                continue
+
+            if not self._connected:
+                # The ticket transiently reported no assets; keep trying
+                # rather than silently ending monitoring for the location.
+                _LOGGER.warning(
+                    'Reconnect for "%s" found no Kidde assets, retrying',
+                    self.location_name,
+                )
+                continue
+
             if devices and self._on_devices_discovered:
                 self._on_devices_discovered(devices)
+            return
 
     async def _send_message(self, message: dict) -> None:
         """Send a message over the WebSocket."""
@@ -325,7 +445,10 @@ class SmokeDetectorWebSocket:
         )
 
     async def _close_ws(self) -> None:
-        """Close the WebSocket and its HTTP session."""
+        """Close the WebSocket and stop the message loop."""
+        was_connected = self._connected
+        self._connected = False
+
         if self._message_task and not self._message_task.done():
             self._message_task.cancel()
             try:
@@ -338,11 +461,19 @@ class SmokeDetectorWebSocket:
             await self._ws.close()
         self._ws = None
 
-        if self._ws_session and not self._ws_session.closed:
-            await self._ws_session.close()
-        self._ws_session = None
+        if was_connected and self._on_connection_change and not self._disconnected:
+            self._on_connection_change(False)
 
     async def disconnect(self) -> None:
         """Clean shutdown -- close the WebSocket and stop reconnecting."""
         self._disconnected = True
+
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+        self._reconnect_task = None
+
         await self._close_ws()

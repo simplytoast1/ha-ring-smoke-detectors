@@ -15,15 +15,45 @@
         "data": {
           "code": "Verification Code"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Ring Account",
+        "description": "Ring rejected the stored credentials. Enter your Ring password again to reconnect.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid email or password. Please try again.",
       "invalid_2fa_code": "Invalid verification code. Please try again.",
+      "cannot_connect": "Could not reach Ring's servers. Please try again later.",
       "unknown": "An unexpected error occurred. Check the logs for details."
     },
     "abort": {
-      "already_configured": "This Ring account is already configured."
+      "already_configured": "This Ring account is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "wrong_account": "The email entered does not match the account this entry was set up with."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "co_level": {
+        "name": "CO level"
+      }
+    },
+    "event": {
+      "test_button": {
+        "name": "Test button",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "test": "Test"
+            }
+          }
+        }
+      }
     }
   }
 }
