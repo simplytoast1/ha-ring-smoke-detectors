@@ -2,14 +2,16 @@
 
 Manages WebSocket connections to Ring's servers and coordinates device
 state updates across all entities. Uses HA's DataUpdateCoordinator with
-push-based updates from the WebSocket. The hourly poll re-runs discovery
-so locations that failed to connect (or gained devices) are picked up
-without a restart.
+push-based updates from the WebSocket. A dedicated hourly rediscovery
+timer (independent of push updates, which reset the coordinator's own
+schedule) re-runs discovery so locations that failed to connect or
+gained devices are picked up without a restart.
 """
 
+import asyncio
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -18,6 +20,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -42,6 +45,8 @@ _LOGGER = logging.getLogger(__name__)
 
 RingSmokeConfigEntry = ConfigEntry["RingSmokeCoordinator"]
 
+REDISCOVERY_INTERVAL = timedelta(hours=1)
+
 
 class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """Coordinator for Ring smoke detector data.
@@ -52,12 +57,13 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """
 
     def __init__(self, hass: HomeAssistant, entry: RingSmokeConfigEntry) -> None:
+        # No update_interval: push updates via async_set_updated_data
+        # would keep resetting it, so rediscovery gets its own timer.
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
             config_entry=entry,
-            update_interval=timedelta(hours=1),
         )
         self.entry = entry
         self._session = async_get_clientsession(hass)
@@ -73,6 +79,16 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._connection_state: dict[str, bool] = {}
         # zid -> monotonic time of the last fired test event (dedupe)
         self._last_test_event: dict[str, float] = {}
+        # Serializes discovery so a disconnect-triggered refresh cannot
+        # race the scheduled one and create duplicate websockets.
+        self._discovery_lock = asyncio.Lock()
+        self._unsub_rediscovery = async_track_time_interval(
+            hass, self._scheduled_rediscovery, REDISCOVERY_INTERVAL
+        )
+
+    async def _scheduled_rediscovery(self, _now: datetime) -> None:
+        """Periodic rediscovery of locations and devices."""
+        await self.async_request_refresh()
 
     def is_device_available(self, zid: str) -> bool:
         """Whether the websocket serving this device is connected."""
@@ -118,6 +134,10 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         is the only reliable discovery method -- the REST API does not
         reliably list these devices.
         """
+        async with self._discovery_lock:
+            await self._discover_devices_locked()
+
+    async def _discover_devices_locked(self) -> None:
         try:
             data = await self.rest_client.request(f"{DEVICE_API_BASE}locations")
         except RingAuthError as err:
@@ -259,7 +279,6 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self, location_id: str, devices: list[dict]
     ) -> None:
         """Handle device list from WebSocket reconnect (may include new devices)."""
-        changed = False
         for device in devices:
             zid = device.get("zid")
             device_type = device.get("deviceType", "")
@@ -270,12 +289,13 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                         device.get("name"),
                         device_type,
                     )
-                    changed = True
                 # Discovery responses are full documents, so replace
                 self.devices[zid] = device
                 self._device_locations[zid] = location_id
-        if changed:
-            self.async_set_updated_data(self.devices)
+        # Always notify: alarm or battery changes that happened while the
+        # websocket was down only exist in these documents, and entities
+        # were last notified with the pre-disconnect snapshot.
+        self.async_set_updated_data(self.devices)
 
     def _handle_connection_change(self, location_id: str, connected: bool) -> None:
         """Track per-location websocket health for entity availability."""
@@ -302,6 +322,13 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         impulse for a test button press. Prefix-match to tolerate
         variants like "alarm.testing.started".
         """
+        if zid not in self.devices:
+            _LOGGER.debug(
+                "Ignoring impulse(s) %s for untracked device %s",
+                impulse_types,
+                zid,
+            )
+            return
         for impulse_type in impulse_types:
             if impulse_type.startswith(IMPULSE_ALARM_TESTING):
                 self._fire_test_event(zid, f"impulse {impulse_type}")
@@ -398,8 +425,18 @@ class RingSmokeCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     async def async_shutdown(self) -> None:
         """Clean up WebSocket connections on unload or HA shutdown."""
         _LOGGER.info("Shutting down Ring Smoke Detectors")
+        if self._unsub_rediscovery:
+            self._unsub_rediscovery()
+            self._unsub_rediscovery = None
         await super().async_shutdown()
         for conn in self.connections.values():
-            await conn.disconnect()
+            try:
+                await conn.disconnect()
+            except Exception:
+                # One failed disconnect must not strand the others
+                _LOGGER.exception(
+                    'Error disconnecting websocket for location "%s"',
+                    conn.location_name,
+                )
         self.connections.clear()
         self._connection_state.clear()

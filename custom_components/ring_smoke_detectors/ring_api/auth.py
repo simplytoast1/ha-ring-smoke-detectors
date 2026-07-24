@@ -117,6 +117,9 @@ class RingRestClient:
         self._access_token: str | None = None
         self._session_created = False
         self.prompt_for_2fa: str | None = None
+        # Ring refresh tokens are single-use; concurrent refreshes would
+        # double-spend one and invalidate the account's stored token.
+        self._auth_lock = asyncio.Lock()
 
     async def authenticate(self, two_factor_code: str | None = None) -> str:
         """Authenticate with Ring and return the refresh token.
@@ -249,8 +252,12 @@ class RingRestClient:
         return body if isinstance(body, dict) else {}
 
     async def _ensure_access_token(self) -> None:
-        if not self._access_token:
-            await self.authenticate()
+        if self._access_token:
+            return
+        async with self._auth_lock:
+            # Another caller may have refreshed while we waited
+            if not self._access_token:
+                await self.authenticate()
 
     async def _ensure_session(self) -> None:
         """Create a Ring session (registers this device with Ring servers).
@@ -291,6 +298,12 @@ class RingRestClient:
                             "Ring session rejected the access token even "
                             "after re-authentication"
                         )
+                    if resp.status >= 400:
+                        _LOGGER.warning(
+                            "Ring session creation returned %s, "
+                            "continuing without it",
+                            resp.status,
+                        )
                     self._session_created = True
                     return
             except (aiohttp.ClientError, TimeoutError) as err:
@@ -302,11 +315,22 @@ class RingRestClient:
                 return
 
     async def request(self, url: str) -> Any:
-        """Make an authenticated GET request to a Ring API endpoint."""
+        """Make an authenticated GET request to a Ring API endpoint.
+
+        A 401 triggers one re-authentication without consuming a retry
+        attempt; a second 401 after that means the fresh token is being
+        rejected too and raises RingAuthError so the caller can start a
+        reauth flow. A 401 that never gets a post-reauth attempt (e.g.
+        the token expired on the final retry) stays a transient
+        RingApiError, because the stored refresh token may be fine.
+        """
         await self._ensure_session()
 
         last_err: Exception | None = None
-        for attempt in range(3):
+        last_status: int | None = None
+        reauthed = False
+        attempts_left = 3
+        while attempts_left > 0:
             try:
                 async with self._session.get(
                     url,
@@ -318,10 +342,17 @@ class RingRestClient:
                     },
                     timeout=REQUEST_TIMEOUT,
                 ) as resp:
+                    last_status = resp.status
                     if resp.status == 401:
+                        if reauthed:
+                            raise RingAuthError(
+                                f"Ring kept rejecting the access token "
+                                f"for {url} after re-authentication"
+                            )
                         self._access_token = None
                         self._session_created = False
                         await self._ensure_session()
+                        reauthed = True
                         continue
                     if resp.status == 429:
                         retry_after = resp.headers.get("retry-after", "")
@@ -334,16 +365,19 @@ class RingRestClient:
                         _LOGGER.warning(
                             "Rate limited by Ring, waiting %s seconds", wait
                         )
+                        attempts_left -= 1
                         await asyncio.sleep(wait + 1)
                         continue
                     if resp.status == 504:
+                        attempts_left -= 1
                         await asyncio.sleep(5)
                         continue
                     resp.raise_for_status()
                     return await resp.json()
             except (aiohttp.ClientError, TimeoutError) as err:
                 last_err = err
-                if attempt == 2:
+                attempts_left -= 1
+                if attempts_left <= 0:
                     raise RingApiError(
                         f"Request to {url} failed: {err}"
                     ) from err
@@ -351,5 +385,6 @@ class RingRestClient:
 
         raise RingApiError(
             f"Request to {url} failed after retries"
+            + (f" (last status: {last_status})" if last_status else "")
             + (f" (last error: {last_err})" if last_err else "")
         )

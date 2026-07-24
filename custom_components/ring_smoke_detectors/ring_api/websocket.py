@@ -141,6 +141,7 @@ class SmokeDetectorWebSocket:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._disconnected = False
         self._connected = False
+        self._reconnect_requested = False
         self._consecutive_failures = 0
         self._seq = 1
         self._devices: list[dict] = []
@@ -372,10 +373,30 @@ class SmokeDetectorWebSocket:
                     if zid and self._on_impulse:
                         self._on_impulse(zid, impulses)
 
+    def _is_live(self) -> bool:
+        """Whether the socket and message loop are actually running.
+
+        The _connected flag alone can be stale: the message loop can die
+        while a reconnect attempt is still inside its discovery wait, and
+        only _close_ws resets the flag.
+        """
+        return (
+            self._ws is not None
+            and not self._ws.closed
+            and self._message_task is not None
+            and not self._message_task.done()
+        )
+
     def _schedule_reconnect(self) -> None:
-        """Start the reconnect loop unless one is already running."""
+        """Request a reconnect, starting the loop if none is running.
+
+        The request flag is set even when a loop is already running so a
+        drop that happens during that loop's own discovery window is not
+        lost (the loop re-checks the flag before declaring success).
+        """
         if self._disconnected:
             return
+        self._reconnect_requested = True
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
@@ -388,7 +409,10 @@ class SmokeDetectorWebSocket:
         end monitoring for the location.
         """
         while not self._disconnected:
+            self._reconnect_requested = False
             await self._close_ws()
+            if self._disconnected:
+                return
 
             self._consecutive_failures += 1
             delay = min(
@@ -420,11 +444,12 @@ class SmokeDetectorWebSocket:
                 )
                 continue
 
-            if not self._connected:
-                # The ticket transiently reported no assets; keep trying
-                # rather than silently ending monitoring for the location.
+            if not self._is_live() or self._reconnect_requested:
+                # Either the ticket transiently reported no assets, or
+                # the socket dropped again during the discovery window.
+                # Keep trying rather than silently ending monitoring.
                 _LOGGER.warning(
-                    'Reconnect for "%s" found no Kidde assets, retrying',
+                    'Reconnect for "%s" did not come up cleanly, retrying',
                     self.location_name,
                 )
                 continue
@@ -444,17 +469,33 @@ class SmokeDetectorWebSocket:
             json.dumps({"channel": "message", "msg": message})
         )
 
+    @staticmethod
+    async def _cancel_and_wait(task: asyncio.Task) -> None:
+        """Cancel a child task and wait for it to finish.
+
+        Re-raises CancelledError only when the CURRENT task received a
+        new cancel request during the wait. Task.cancelling() stays
+        elevated for the rest of a task's life once a cancellation has
+        been caught, so comparing against a snapshot is required; a bare
+        cancelling() check would abort cleanup that runs after a caught
+        cancellation (the setup-failure path) and leak connections.
+        """
+        current = asyncio.current_task()
+        before = current.cancelling() if current else 0
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            if current and current.cancelling() > before:
+                raise
+
     async def _close_ws(self) -> None:
         """Close the WebSocket and stop the message loop."""
         was_connected = self._connected
         self._connected = False
 
         if self._message_task and not self._message_task.done():
-            self._message_task.cancel()
-            try:
-                await self._message_task
-            except asyncio.CancelledError:
-                pass
+            await self._cancel_and_wait(self._message_task)
         self._message_task = None
 
         if self._ws and not self._ws.closed:
@@ -469,11 +510,7 @@ class SmokeDetectorWebSocket:
         self._disconnected = True
 
         if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            try:
-                await self._reconnect_task
-            except asyncio.CancelledError:
-                pass
+            await self._cancel_and_wait(self._reconnect_task)
         self._reconnect_task = None
 
         await self._close_ws()

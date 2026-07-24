@@ -48,7 +48,7 @@ location is down, so a connection outage is never mistaken for "no smoke".
 
 ## Prerequisites
 
-- [Home Assistant](https://www.home-assistant.io/) 2024.8 or later
+- [Home Assistant](https://www.home-assistant.io/) 2024.11 or later
 - [HACS](https://hacs.xyz) installed
 - A Ring account with Kidde/Ring smoke detectors set up in the Ring app
 

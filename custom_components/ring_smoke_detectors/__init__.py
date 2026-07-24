@@ -27,15 +27,14 @@ async def async_setup_entry(
 
     try:
         await coordinator.async_config_entry_first_refresh()
-    except Exception:
-        # Setup failures never reach async_unload_entry, so close any
-        # websockets that were established before the failure.
+        entry.runtime_data = coordinator
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        # Setup failures (including cancellation) never reach
+        # async_unload_entry, so close any websockets that were
+        # established before the failure.
         await coordinator.async_shutdown()
         raise
-
-    entry.runtime_data = coordinator
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
