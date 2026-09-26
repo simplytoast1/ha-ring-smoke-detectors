@@ -14,9 +14,10 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import CONCENTRATION_PARTS_PER_MILLION, PERCENTAGE
+from homeassistant.const import CONCENTRATION_PARTS_PER_MILLION, PERCENTAGE, SIGNAL_STRENGTH_DECIBELS_MILLIWATT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .const import BATTERY_STATUS_PERCENT
 from .coordinator import RingSmokeConfigEntry, RingSmokeCoordinator
@@ -46,8 +47,14 @@ async def async_setup_entry(
                 continue
             known_zids.add(zid)
 
+            # All models report last communication date/time
+            entities.append(RingLastCommDateTimeSensor(coordinator, zid))
+
             # All models report a battery status
             entities.append(RingBatterySensor(coordinator, zid))
+
+            # All models report WiFi signal strength
+            entities.append(RingWifiSignalStrengthSensor(coordinator, zid))
 
             # CO models get a CO PPM level sensor
             if not is_smoke_only(device.get("deviceType", "")):
@@ -127,3 +134,39 @@ class RingCOLevelSensor(RingSmokeDetectorEntity, SensorEntity):
         components = self._device_data.get("components") or {}
         co_level = components.get("co.level") or {}
         return co_level.get("reading")
+
+
+class RingWifiSignalStrengthSensor(RingSmokeDetectorEntity, SensorEntity):
+    """Sensor for WiFi signal strength."""
+
+    _attr_name = "WiFi Signal Strength"
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: RingSmokeCoordinator, zid: str) -> None:
+        super().__init__(coordinator, zid, "wifi_signal_strength")
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the WiFi signal strength in dBm, or None when no reading exists."""
+        components = self._device_data.get("components") or {}
+        co_level = components.get("networks:wlan0") or {}
+        return co_level.get("rssi")
+
+
+class RingLastCommDateTimeSensor(RingSmokeDetectorEntity, SensorEntity):
+    """Sensor for last communication date/time."""
+
+    _attr_name = "Last Communication Time"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: RingSmokeCoordinator, zid: str) -> None:
+        super().__init__(coordinator, zid, "last_comm_time")
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the last seen timestamp, or None when no reading exists."""
+        last_comm_time_ms = self._device_data.get("lastCommTime")
+        last_comm_time_s = last_comm_time_ms / 1000.0
+        return dt_util.utc_from_timestamp(last_comm_time_s)
