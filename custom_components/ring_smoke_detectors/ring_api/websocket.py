@@ -491,7 +491,6 @@ class SmokeDetectorWebSocket:
 
     async def _close_ws(self) -> None:
         """Close the WebSocket and stop the message loop."""
-        was_connected = self._connected
         self._connected = False
 
         if self._message_task and not self._message_task.done():
@@ -502,7 +501,8 @@ class SmokeDetectorWebSocket:
             await self._ws.close()
         self._ws = None
 
-        if was_connected and self._on_connection_change and not self._disconnected:
+        report_disconnected = (self._consecutive_failures == 1)
+        if report_disconnected and self._on_connection_change and not self._disconnected:
             self._on_connection_change(False)
 
     async def disconnect(self) -> None:
